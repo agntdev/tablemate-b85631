@@ -14,6 +14,7 @@ import { webhookCallback, Composer, type Bot } from "grammy";
 import { buildBot, type Ctx } from "./bot.js";
 import { handlers } from "./handlers.generated.js";
 import { createDurableSessionStorage, type WorkerEnv } from "./toolkit/session/durable.js";
+import { reservationStore } from "./reservations.js";
 
 export { ChatDO } from "./toolkit/session/durable.js";
 
@@ -80,5 +81,16 @@ export default {
     }
 
     return new Response("not found", { status: 404 });
+  },
+  async scheduled(_event: unknown, env: WorkerEnv): Promise<void> {
+    const sweep = await reservationStore.reminders(env);
+    for (const booking of sweep?.due ?? []) {
+      try { await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chat_id: booking.chatId, text: `Reminder: your table is today at ${booking.startTime}. Your confirmation code is ${booking.referenceCode}.` }) }); } catch { /* a blocked guest must not stop other reminders */ }
+    }
+    for (const booking of sweep?.noShows ?? []) {
+      const owner = env.ADMIN_CHAT_ID;
+      if (!owner) continue;
+      try { await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chat_id: owner, text: `A ${booking.partySize}-guest booking at ${booking.startTime} was marked as a no-show.` }) }); } catch { /* continue notifying other owners/guests */ }
+    }
   },
 };

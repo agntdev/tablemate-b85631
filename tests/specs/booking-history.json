@@ -5,9 +5,9 @@
       {
         "expect": [
           {
-            "method": "sendMessage",
+            "method": "editMessageText",
             "payload": {
-              "text": "Shows user's current and past bookings"
+              "text": "Bookings aren't available right now. Please try again shortly."
             }
           }
         ],

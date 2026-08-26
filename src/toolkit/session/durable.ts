@@ -14,6 +14,7 @@
  */
 
 import type { StorageAdapter } from "grammy";
+import { now, referenceFor, type Booking, type VenueConfig } from "../../reservations.js";
 
 // Minimal shapes so this file type-checks without pulling @cloudflare/workers-types
 // into the Node build. The real bindings are provided by the Workers runtime.
@@ -43,6 +44,7 @@ export interface WorkerEnv {
   BOT_TELEMETRY_URL?: string;
   BOT_TELEMETRY_SECRET?: string;
   BOT_TELEMETRY_SALT?: string;
+  ADMIN_CHAT_ID?: string;
 }
 
 interface Reminder {
@@ -154,6 +156,100 @@ export class ChatDO {
       return new Response(null, { status: 204 });
     }
 
+    if (url.pathname.startsWith("/reservations/")) {
+      return this.reservations(url.pathname.slice("/reservations/".length), request);
+    }
+
+    return new Response("not found", { status: 404 });
+  }
+
+  private async reservations(action: string, request: Request): Promise<Response> {
+    const read = <T>(key: string) => this.state.storage.get<T>(key);
+    const configKey = "venue:config";
+    if (action === "config") {
+      if (request.method === "GET") {
+        const config = await read<VenueConfig>(configKey);
+        return config ? Response.json(config) : new Response(null, { status: 204 });
+      }
+      const config = await request.json() as VenueConfig;
+      await this.state.storage.put(configKey, config);
+      return Response.json(config);
+    }
+    if (action.startsWith("guest/") || action.startsWith("date/")) {
+      const key = action.startsWith("guest/") ? `booking:guest:${action.slice(6)}` : `booking:date:${action.slice(5)}`;
+      const ids = (await read<string[]>(key)) ?? [];
+      const bookings: Booking[] = [];
+      for (const id of ids) { const booking = await read<Booking>(`booking:${id}`); if (booking) bookings.push(booking); }
+      return Response.json(bookings);
+    }
+    if (action.startsWith("availability/")) {
+      const config = await read<VenueConfig>(configKey);
+      if (!config) return Response.json([]);
+      const date = action.slice("availability/".length);
+      const ids = (await read<string[]>(`booking:date:${date}`)) ?? [];
+      const bookings: Booking[] = [];
+      for (const id of ids) { const booking = await read<Booking>(`booking:${id}`); if (booking?.status === "confirmed") bookings.push(booking); }
+      const available = config.openingHours.filter((time) => assignTables(config, 1, bookings.filter((booking) => booking.startTime === time).flatMap((booking) => booking.assignedTables)).length > 0);
+      return Response.json(available);
+    }
+    if (action === "reserve" && request.method === "POST") {
+      const input = await request.json() as Omit<Booking, "id" | "assignedTables" | "status" | "referenceCode">;
+      const config = await read<VenueConfig>(configKey);
+      if (!config) return Response.json({ error: "not_configured" });
+      const dateKey = `booking:date:${input.date}`;
+      const ids = (await read<string[]>(dateKey)) ?? [];
+      const concurrent: Booking[] = [];
+      for (const id of ids) { const booking = await read<Booking>(`booking:${id}`); if (booking?.status === "confirmed" && booking.startTime === input.startTime) concurrent.push(booking); }
+      const used = concurrent.reduce((sum, booking) => sum + booking.partySize, 0);
+      if (used + input.partySize > config.totalSeats) return Response.json({ error: "full" });
+      const tables = assignTables(config, input.partySize, concurrent.flatMap((booking) => booking.assignedTables));
+      const capacity = tables.length;
+      if (capacity === 0) return Response.json({ error: "full" });
+      const id = `${input.chatId}-${input.date.replaceAll("-", "")}-${input.startTime.replace(":", "")}-${input.partySize}`;
+      const booking: Booking = { ...input, id, assignedTables: tables, status: "confirmed", referenceCode: referenceFor(input) };
+      await this.state.storage.put(`booking:${id}`, booking);
+      if (!ids.includes(id)) await this.state.storage.put(dateKey, [...ids, id]);
+      const guestKey = `booking:guest:${input.chatId}`;
+      const guestIds = (await read<string[]>(guestKey)) ?? [];
+      if (!guestIds.includes(id)) await this.state.storage.put(guestKey, [...guestIds, id]);
+      const dates = (await read<string[]>("booking:dates")) ?? [];
+      if (!dates.includes(input.date)) await this.state.storage.put("booking:dates", [...dates, input.date]);
+      return Response.json({ booking });
+    }
+    if (action.startsWith("update/") && request.method === "POST") {
+      const id = action.slice(7); const next = await request.json() as Booking;
+      const previous = await read<Booking>(`booking:${id}`);
+      if (!previous || previous.chatId !== next.chatId) return new Response(null, { status: 404 });
+      if (previous.date !== next.date || previous.startTime !== next.startTime) {
+        const config = await read<VenueConfig>(configKey);
+        const ids = (await read<string[]>(`booking:date:${next.date}`)) ?? [];
+        const concurrent: Booking[] = [];
+        for (const candidateId of ids) { const candidate = await read<Booking>(`booking:${candidateId}`); if (candidate && candidate.id !== id && candidate.status === "confirmed" && candidate.startTime === next.startTime) concurrent.push(candidate); }
+        if (!config || !assignTables(config, next.partySize, concurrent.flatMap((booking) => booking.assignedTables)).length) return new Response(null, { status: 409 });
+        next.assignedTables = assignTables(config, next.partySize, concurrent.flatMap((booking) => booking.assignedTables));
+        const oldIds = (await read<string[]>(`booking:date:${previous.date}`)) ?? [];
+        await this.state.storage.put(`booking:date:${previous.date}`, oldIds.filter((candidate) => candidate !== id));
+        if (!ids.includes(id)) await this.state.storage.put(`booking:date:${next.date}`, [...ids, id]);
+        const dates = (await read<string[]>("booking:dates")) ?? [];
+        if (!dates.includes(next.date)) await this.state.storage.put("booking:dates", [...dates, next.date]);
+      }
+      await this.state.storage.put(`booking:${id}`, next);
+      return Response.json(next);
+    }
+    if (action === "reminders") {
+      const config = await read<VenueConfig>(configKey);
+      if (!config) return Response.json([]);
+      const dates = (await read<string[]>("booking:dates")) ?? [];
+      const current = now().getTime(); const due: Booking[] = []; const noShows: Booking[] = [];
+      for (const date of dates) for (const id of (await read<string[]>(`booking:date:${date}`)) ?? []) {
+        const booking = await read<Booking>(`booking:${id}`);
+        if (!booking || booking.status !== "confirmed") continue;
+        const startsAt = zonedEpoch(booking.date, booking.startTime, config.timezone);
+        if (startsAt <= current) { booking.status = "no_show"; await this.state.storage.put(`booking:${id}`, booking); noShows.push(booking); continue; }
+        if (!booking.reminderSent && startsAt - config.reminderHoursBefore * 3_600_000 <= current) { booking.reminderSent = true; await this.state.storage.put(`booking:${id}`, booking); due.push(booking); }
+      }
+      return Response.json({ due, noShows });
+    }
     return new Response("not found", { status: 404 });
   }
 
@@ -179,4 +275,25 @@ export class ChatDO {
       await this.state.storage.setAlarm(next);
     }
   }
+}
+
+function assignTables(config: VenueConfig, partySize: number, occupied: number[]): number[] {
+  const taken = new Set(occupied); const tables: number[] = []; let capacity = 0; let tableNo = 1;
+  for (const [sizeText, count] of Object.entries(config.tableCountBySize).sort((a, b) => Number(b[0]) - Number(a[0]))) {
+    for (let i = 0; i < count; i += 1) { if (!taken.has(tableNo) && capacity < partySize) { tables.push(tableNo); capacity += Number(sizeText); } tableNo += 1; }
+    if (capacity >= partySize) return tables;
+  }
+  return [];
+}
+
+function zonedEpoch(date: string, time: string, timezone: string): number {
+  const [year, month, day] = date.split("-").map(Number); const [hour, minute] = time.split(":").map(Number);
+  let epoch = Date.UTC(year, month - 1, day, hour, minute);
+  for (let i = 0; i < 2; i += 1) {
+    const parts = new Intl.DateTimeFormat("en-CA", { timeZone: timezone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date(epoch));
+    const part = (kind: string) => Number(parts.find((p) => p.type === kind)?.value ?? 0);
+    const shown = Date.UTC(part("year"), part("month") - 1, part("day"), part("hour"), part("minute"));
+    epoch += Date.UTC(year, month - 1, day, hour, minute) - shown;
+  }
+  return epoch;
 }
