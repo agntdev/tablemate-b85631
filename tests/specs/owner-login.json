@@ -7,7 +7,7 @@
           {
             "method": "sendMessage",
             "payload": {
-              "text": "Requests owner authentication to access admin features"
+              "text": "Owner access isn't set up yet."
             }
           }
         ],
